@@ -261,6 +261,9 @@ install_dependencies() {
 
   snap install aws-cli --classic
   snap install certbot --classic
+  
+  snap set certbot trust-plugin-with-root=ok
+  snap install certbot-dns-cloudflare
 
   # Add Docker’s official GPG key
   install -m 0755 -d /etc/apt/keyrings
@@ -324,7 +327,16 @@ update_dns_resolvers() {
     systemctl mask systemd-resolved
   fi
   
-  echo "nameserver 1.1.1.1" | tee /etc/resolv.conf
+  tee /etc/resolv.conf > /dev/null <<EOF
+nameserver 1.1.1.1
+nameserver 2606:4700:4700::1111
+nameserver 1.0.0.1
+nameserver 2606:4700:4700::1001
+nameserver 8.8.8.8
+nameserver 2001:4860:4860::8888
+nameserver 8.8.4.4
+nameserver 2001:4860:4860::8844
+EOF
 }
 
 update_env_file() {
@@ -453,11 +465,8 @@ clone_repo() {
     echo "Directory $ROOT_DIR already exists. Skipping git clone."
     cd "$ROOT_DIR"
   else
-    git clone --filter=blob:none --no-checkout "$REPO_URL" "$ROOT_DIR"
+    git clone "$REPO_URL" "$ROOT_DIR"
     cd "$ROOT_DIR"
-    git sparse-checkout init --no-cone
-    git sparse-checkout set self-hosting
-    git checkout master
   fi
 }
 
@@ -606,6 +615,12 @@ source /etc/lsb-release
 if [[ "$DISTRIB_ID" != "Ubuntu" ]]; then
     echo -e "⚠️  Warning: This script is in beta and currently only supports Ubuntu. Your system is not supported yet."
     exit 1
+fi
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+  echo "This script must be run as root. Exiting."
+  exit 1
 fi
 
 prompt_command
