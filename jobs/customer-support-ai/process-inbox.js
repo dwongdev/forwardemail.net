@@ -19,7 +19,10 @@ const VectorStore = require('#helpers/customer-support-ai/vector-store');
 const messageAnalyzer = require('#helpers/customer-support-ai/message-analyzer');
 const responseGenerator = require('#helpers/customer-support-ai/response-generator');
 const {
+  extractSenderEmail,
   extractSenderText,
+  extractCC,
+  extractRecipients,
   buildReplyRecipients
 } = require('#helpers/customer-support-ai/message-utils');
 
@@ -344,10 +347,39 @@ async function createDraft(message, analysis, generatedResponse) {
     const from = config.forwardEmailAliasUsername;
 
     // Build reply recipients (handles Reply-To and CC)
-    const { to, cc } = buildReplyRecipients(message, from);
+    let { to, cc } = buildReplyRecipients(message, from);
+
+    // CRITICAL: Never reply back to ourselves (support@forwardemail.net)
+    // If the original sender is support@forwardemail.net, this is a help request notification
+    // Reply to the To header (the actual customer) instead
+    const originalSender = extractSenderEmail(message);
+    if (originalSender && originalSender.toLowerCase() === from.toLowerCase()) {
+      // This email is from us (support@forwardemail.net)
+      // Reply to the To recipients (the actual customer)
+      const toRecipients = extractRecipients(message);
+      const nonSupportRecipients = toRecipients.filter(
+        (email) => email.toLowerCase() !== from.toLowerCase()
+      );
+
+      if (nonSupportRecipients.length > 0) {
+        to = nonSupportRecipients[0];
+        cc = nonSupportRecipients.slice(1);
+        logger.info(
+          { originalSender, newTo: to, toRecipients, messageId: message.id },
+          'Adjusted recipients - original sender was support@forwardemail.net, replying to To recipient'
+        );
+      } else {
+        // This is a self-email with no other recipients - skip it
+        logger.warn(
+          { messageId: message.id, toRecipients },
+          'Skipping draft creation - email is from support@forwardemail.net with no other recipients'
+        );
+        return null;
+      }
+    }
 
     // Get original message details for quoting
-    const originalSender = extractSenderText(message);
+    const originalSenderText = extractSenderText(message);
     const originalDate =
       message.nodemailer?.date || message.header_date || new Date();
     const formattedDate = new Date(originalDate).toLocaleString('en-US', {
@@ -371,14 +403,10 @@ async function createDraft(message, analysis, generatedResponse) {
       .join('\n');
 
     // Build reply with quoted original message
+    // Note: Do NOT add signature here - LLM response should be complete
     const text = `${generatedResponse.response}
 
---
-Thank you,
-Forward Email
-https://forwardemail.net
-
-On ${formattedDate}, ${originalSender} wrote:
+On ${formattedDate}, ${originalSenderText} wrote:
 ${quotedOriginal}`;
 
     // Extract threading headers from API response
@@ -443,17 +471,7 @@ async function processMessage(message, vectorStore, historyVectorStore) {
 
     const fullMessage = await forwardEmailClient.getMessage(message.id);
 
-    // Check for skip-ai label/tag (case-insensitive)
-    const labels = fullMessage.labels || [];
-    const hasSkipAI = labels.some((label) => label.toLowerCase() === 'skip-ai');
-
-    if (hasSkipAI) {
-      logger.info(
-        { messageId: fullMessage.id },
-        'Skipping message with skip-ai label'
-      );
-      return null;
-    }
+    // Note: Draft existence and skip-ai label checks are now done upfront in main loop
 
     // Log message structure to debug content extraction
     logger.debug(
@@ -494,18 +512,7 @@ async function processMessage(message, vectorStore, historyVectorStore) {
       historicalContext
     );
 
-    // Check if a draft already exists for this message
-    const messageId = fullMessage.header_message_id || fullMessage.id;
-    const existingDraft = await checkForExistingDraft(messageId);
-
-    if (existingDraft) {
-      logger.info(
-        { draftId: existingDraft.id, messageId: fullMessage.id },
-        'Skipping draft creation - draft already exists'
-      );
-      return existingDraft;
-    }
-
+    // Note: Draft check is done upfront in main loop, no need to check again
     const draft = await createDraft(fullMessage, analysis, generatedResponse);
 
     logger.info(
@@ -571,14 +578,76 @@ async function processMessage(message, vectorStore, historyVectorStore) {
     });
     await historyVectorStore.initialize();
 
-    const messages = await forwardEmailClient.listMessages({
-      folder: 'INBOX',
-      limit: config.customerSupportAiInboxLimit || 10
+    // OPTIMIZATION: List ALL drafts and inbox messages upfront, then filter
+    logger.info('Listing all drafts to check for existing responses...');
+    const allDrafts = await forwardEmailClient.listAllMessages({
+      folder: 'Drafts'
     });
 
-    logger.info({ count: messages.length }, 'Retrieved inbox messages');
+    // Extract all message IDs that drafts are replying to
+    const draftMessageIds = new Set();
+    for (const draft of allDrafts) {
+      // Check in-reply-to and references headers
+      const inReplyTo = draft.header_in_reply_to || draft.in_reply_to;
+      const references = draft.references || [];
+      
+      if (inReplyTo) draftMessageIds.add(inReplyTo);
+      if (Array.isArray(references)) {
+        for (const ref of references) {
+          draftMessageIds.add(ref);
+        }
+      }
+    }
 
-    for (const message of messages) {
+    logger.info(
+      { totalDrafts: allDrafts.length, uniqueMessageIds: draftMessageIds.size },
+      'Indexed existing drafts'
+    );
+
+    // List ALL inbox messages
+    logger.info('Listing all inbox messages...');
+    const allInboxMessages = await forwardEmailClient.listAllMessages({
+      folder: 'INBOX'
+    });
+
+    logger.info({ count: allInboxMessages.length }, 'Retrieved all inbox messages');
+
+    // Filter out messages that:
+    // 1. Already have drafts
+    // 2. Have "skip-ai" label
+    const messagesToProcess = allInboxMessages.filter((message) => {
+      // Check if draft already exists
+      const messageId = message.header_message_id || message.id;
+      if (draftMessageIds.has(messageId)) {
+        logger.debug(
+          { messageId: message.id },
+          'Skipping - draft already exists'
+        );
+        return false;
+      }
+
+      // Check for skip-ai label
+      const labels = message.labels || [];
+      const hasSkipAI = labels.some((label) => label.toLowerCase() === 'skip-ai');
+      if (hasSkipAI) {
+        logger.debug({ messageId: message.id }, 'Skipping - has skip-ai label');
+        return false;
+      }
+
+      return true;
+    });
+
+    logger.info(
+      {
+        total: allInboxMessages.length,
+        toProcess: messagesToProcess.length,
+        skipped: allInboxMessages.length - messagesToProcess.length
+      },
+      'Filtered messages to process'
+    );
+
+    // Process remaining messages
+    for (const message of messagesToProcess) {
       try {
         await processMessage(message, vectorStore, historyVectorStore);
       } catch (err) {

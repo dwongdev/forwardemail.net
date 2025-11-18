@@ -18,9 +18,14 @@ class MessageAnalyzer {
 
       const analysis = {
         messageId: message.id || message._id,
-        sender: this.extractSender(message),
-        senderName: this.extractSenderName(message),
+        sender: extractSenderEmail(message),
+        senderName: extractSenderName(message),
         subject: message.subject || '(no subject)',
+        date:
+          message.nodemailer?.date ||
+          message.date ||
+          message.header_date ||
+          new Date(),
         content,
         keywords,
         questionType,
@@ -30,8 +35,6 @@ class MessageAnalyzer {
         analyzedAt: new Date()
       };
 
-      console.log('analysis', analysis);
-
       return analysis;
     } catch (err) {
       logger.error(err, {
@@ -40,14 +43,6 @@ class MessageAnalyzer {
       });
       throw err;
     }
-  }
-
-  extractSender(message) {
-    return extractSenderEmail(message);
-  }
-
-  extractSenderName(message) {
-    return extractSenderName(message);
   }
 
   async extractContent(message) {

@@ -867,8 +867,8 @@ const config = {
 
   // customer support AI
   ollamaHost: env.OLLAMA_HOST || 'http://localhost:11434',
-  ollamaModel: env.OLLAMA_MODEL || 'qwen2.5-coder:7b-instruct-q4_K_M',
-  ollamaEmbeddingModel: env.OLLAMA_EMBEDDING_MODEL || 'mxbai-embed-large',
+  ollamaModel: env.OLLAMA_MODEL || 'gpt-oss:20b',
+  ollamaEmbeddingModel: env.OLLAMA_EMBEDDING_MODEL || 'nomic-embed-text',
   ollamaTemperature: Number.parseFloat(env.OLLAMA_TEMPERATURE) || 0.7,
   ollamaMaxTokens: Number.parseInt(env.OLLAMA_MAX_TOKENS, 10) || 2000,
   lancedbPath: env.LANCEDB_PATH,
@@ -877,7 +877,7 @@ const config = {
   forwardEmailAliasUsername: env.FORWARD_EMAIL_ALIAS_USERNAME,
   forwardEmailAliasPassword: env.FORWARD_EMAIL_ALIAS_PASSWORD,
   customerSupportAiInboxLimit:
-    Number.parseInt(env.CUSTOMER_SUPPORT_AI_INBOX_LIMIT, 10) || 10,
+    Number.parseInt(env.CUSTOMER_SUPPORT_AI_INBOX_LIMIT, 10) || 100,
 
   // server
   env: env.NODE_ENV.toLowerCase(),
