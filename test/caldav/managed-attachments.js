@@ -964,3 +964,186 @@ test('full lifecycle: add, retrieve, update, retrieve, remove, verify gone', asy
 
   await deleteObject({ url: objectUrl, headers: t.context.authHeaders });
 });
+
+// ============================================================================
+// Filename with Spaces Tests
+// ============================================================================
+
+test('POST attachment-add should handle filenames with spaces correctly', async (t) => {
+  const objectUrl = await createTestEvent(t);
+  const attachmentData = Buffer.from('Fake PDF content for Arch Tickets');
+
+  // Add attachment with a filename that contains spaces
+  const response = await undici.fetch(`${objectUrl}?action=attachment-add`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': 'attachment; filename="Arch Tickets.pdf"',
+      Prefer: 'return=representation',
+      ...t.context.authHeaders
+    },
+    body: attachmentData
+  });
+
+  t.is(response.status, 201, 'Should return 201 Created');
+  const managedId = response.headers.get('cal-managed-id');
+  t.truthy(managedId, 'Should return Cal-Managed-ID header');
+
+  // Verify the returned ICS has the FILENAME properly quoted
+  const body = await response.text();
+  const uf = unfoldICS(body);
+
+  // The FILENAME value must be double-quoted so parsers don't split on spaces
+  t.regex(
+    uf,
+    /FILENAME="Arch Tickets\.pdf"/,
+    'FILENAME should be double-quoted to prevent space-splitting'
+  );
+
+  // Must NOT contain an unquoted FILENAME=Arch (which would be the broken behavior)
+  t.notRegex(
+    uf,
+    /FILENAME=Arch[^"]/,
+    'FILENAME must not be unquoted (would cause duplicate attachment bug)'
+  );
+
+  // Verify only one ATTACH property exists (no duplicates)
+  const attachCount = (uf.match(/ATTACH;/g) || []).length;
+  t.is(
+    attachCount,
+    1,
+    'Should have exactly one ATTACH property (no duplicates)'
+  );
+
+  // Retrieve the attachment and verify the Content-Disposition filename is correct
+  const getResponse = await undici.fetch(
+    `${objectUrl}?managed-id=${managedId}`,
+    {
+      headers: t.context.authHeaders
+    }
+  );
+  t.is(getResponse.status, 200, 'GET should return 200');
+  const cd = getResponse.headers.get('content-disposition');
+  t.truthy(cd, 'Content-Disposition header should be present');
+  t.true(
+    cd.includes('Arch Tickets.pdf'),
+    'Content-Disposition should contain the full filename with spaces'
+  );
+
+  // Verify the content is correct
+  const content = Buffer.from(await getResponse.arrayBuffer());
+  t.is(content.toString(), 'Fake PDF content for Arch Tickets');
+
+  await deleteObject({ url: objectUrl, headers: t.context.authHeaders });
+});
+
+test('POST attachment-add should handle filenames with multiple spaces', async (t) => {
+  const objectUrl = await createTestEvent(t);
+  const attachmentData = Buffer.from('Multi space filename test');
+
+  const response = await undici.fetch(`${objectUrl}?action=attachment-add`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/pdf',
+      'Content-Disposition':
+        'attachment; filename="My Important Document Draft.pdf"',
+      Prefer: 'return=representation',
+      ...t.context.authHeaders
+    },
+    body: attachmentData
+  });
+
+  t.is(response.status, 201, 'Should return 201 Created');
+  const managedId = response.headers.get('cal-managed-id');
+  t.truthy(managedId);
+
+  const body = await response.text();
+  const uf = unfoldICS(body);
+
+  // Verify the full filename is preserved and quoted
+  t.regex(
+    uf,
+    /FILENAME="My Important Document Draft\.pdf"/,
+    'Multi-space filename should be fully preserved and quoted'
+  );
+
+  // Retrieve and verify
+  const getResponse = await undici.fetch(
+    `${objectUrl}?managed-id=${managedId}`,
+    {
+      headers: t.context.authHeaders
+    }
+  );
+  t.is(getResponse.status, 200);
+  const cd = getResponse.headers.get('content-disposition');
+  t.true(
+    cd.includes('My Important Document Draft.pdf'),
+    'Full multi-space filename should be in Content-Disposition'
+  );
+
+  await deleteObject({ url: objectUrl, headers: t.context.authHeaders });
+});
+
+test('POST attachment-update should preserve filename with spaces', async (t) => {
+  const objectUrl = await createTestEvent(t);
+
+  // First add an attachment with spaces in the name
+  const addResponse = await undici.fetch(`${objectUrl}?action=attachment-add`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': 'attachment; filename="Arch Tickets.pdf"',
+      Prefer: 'return=representation',
+      ...t.context.authHeaders
+    },
+    body: Buffer.from('Original content')
+  });
+  t.is(addResponse.status, 201);
+  const managedId1 = addResponse.headers.get('cal-managed-id');
+  t.truthy(managedId1);
+
+  // Update the attachment, keeping the spaced filename
+  const updateResponse = await undici.fetch(
+    `${objectUrl}?action=attachment-update&managed-id=${managedId1}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/pdf',
+        'Content-Disposition': 'attachment; filename="Arch Tickets.pdf"',
+        Prefer: 'return=representation',
+        ...t.context.authHeaders
+      },
+      body: Buffer.from('Updated content')
+    }
+  );
+  t.is(updateResponse.status, 200, 'Update should return 200');
+  const managedId2 = updateResponse.headers.get('cal-managed-id');
+  t.truthy(managedId2);
+
+  const body = await updateResponse.text();
+  const uf = unfoldICS(body);
+
+  // Verify filename is still properly quoted after update
+  t.regex(
+    uf,
+    /FILENAME="Arch Tickets\.pdf"/,
+    'Updated FILENAME should still be double-quoted'
+  );
+
+  // Verify only one ATTACH property (no duplicates from update)
+  const attachCount = (uf.match(/ATTACH;/g) || []).length;
+  t.is(attachCount, 1, 'Should have exactly one ATTACH after update');
+
+  // Retrieve updated content
+  const getResponse = await undici.fetch(
+    `${objectUrl}?managed-id=${managedId2}`,
+    {
+      headers: t.context.authHeaders
+    }
+  );
+  t.is(getResponse.status, 200);
+  const content = Buffer.from(await getResponse.arrayBuffer());
+  t.is(content.toString(), 'Updated content');
+
+  await deleteObject({ url: objectUrl, headers: t.context.authHeaders });
+});
