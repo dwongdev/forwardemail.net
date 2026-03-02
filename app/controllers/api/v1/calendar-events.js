@@ -23,6 +23,7 @@ const {
   sendCalendarEmail
 } = require('#helpers/send-calendar-email');
 const _ = require('#helpers/lodash');
+const { quoteICSFilenames } = require('#helpers/ical-filename');
 
 const exdateRegex =
   /^EXDATE(?:;TZID=[\w/+=-]+|;VALUE=DATE)?:\d{8}(?:T\d{6}(?:\.\d{1,3})?Z?)?$/;
@@ -498,8 +499,8 @@ async function create(ctx) {
     // calendar reference
     calendar: calendar._id,
 
-    // iCal data
-    ical: body.ical,
+    // iCal data (sanitize FILENAME params for RFC 5545 compliance)
+    ical: quoteICSFilenames(body.ical),
 
     // Construct href for CalDAV sync-collection responses
     // This matches the CalDAV URL format: /cal/{principalId}/{calendarId}/{eventId}.ics
@@ -605,9 +606,9 @@ async function update(ctx) {
   // Save old ICS for detecting removed attendees
   const oldIcal = calendarEvent.ical;
 
-  // Update iCal data if specified
+  // Update iCal data if specified (sanitize FILENAME params for RFC 5545 compliance)
   if (body.ical !== undefined) {
-    calendarEvent.ical = body.ical;
+    calendarEvent.ical = quoteICSFilenames(body.ical);
   }
 
   // Set db virtual helpers
