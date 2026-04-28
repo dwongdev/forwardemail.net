@@ -799,6 +799,13 @@ async function onAuth(auth, session, fn) {
               return;
             }
 
+            await this.client.set(
+              `imap_check:${alias.id}`,
+              true,
+              'PX',
+              ms('7d')
+            );
+
             await email({
               template: 'alert',
               message: {
