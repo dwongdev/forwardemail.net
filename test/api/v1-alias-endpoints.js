@@ -643,6 +643,316 @@ END:VCALENDAR`
   t.truthy(res.headers['x-page-current']);
 });
 
+// Regression: time-range queries against recurring events must use each
+// event's own DTSTART as the rule anchor. The previous bug dropped
+// DTSTART before passing the rule text to rrulestr(), which defaulted
+// the anchor to parse-time and collapsed INTERVAL phase across all
+// recurring events in the request — producing both false positives
+// (matching events that shouldn't fire) and false negatives (missing
+// events that should). The three series below share an identical
+// FREQ=MONTHLY;INTERVAL=3;BYDAY=-1TH rule but differ in DTSTART, so the
+// "every 3 months" phase distinguishes them.
+test('lists recurring events anchored to their own DTSTART, not parse-time', async (t) => {
+  const { api } = t.context;
+  const { alias, domain, pass } = await createTestAlias(t);
+  const auth = createAliasAuth(`${alias.name}@${domain.name}`, pass);
+
+  const calendarRes = await api
+    .post('/v1/calendars')
+    .set('Authorization', auth)
+    .send({ name: 'Recurrence Test' });
+  t.is(calendarRes.status, 200);
+  const calendarId = calendarRes.body.id;
+
+  // FREQ=MONTHLY;INTERVAL=3;BYDAY=-1TH means "last Thursday, every 3 months
+  // from DTSTART". The phase comes from DTSTART, so:
+  //   July 31, 2025  → Jul 31 / Oct 30 / Jan 29 2026 / Apr 30 2026 / ...
+  //   Aug 28, 2025   → Aug 28 / Nov 27 / Feb 26 2026 / May 28 2026 / ...
+  //   June 26, 2025  → Jun 26 / Sep 25 / Dec 25 / Mar 26 2026 / Jun 25 2026 / ...
+  const series = [
+    { uid: 'jul-anchored', dtstart: '20250731T100000Z' },
+    { uid: 'aug-anchored', dtstart: '20250828T100000Z' },
+    { uid: 'jun-anchored', dtstart: '20250626T100000Z' }
+  ];
+
+  for (const s of series) {
+    const ical =
+      'BEGIN:VCALENDAR\r\n' +
+      'VERSION:2.0\r\n' +
+      'PRODID:-//Forward Email//Test//EN\r\n' +
+      'BEGIN:VEVENT\r\n' +
+      `UID:${s.uid}@example.com\r\n` +
+      `DTSTART:${s.dtstart}\r\n` +
+      `DTEND:${s.dtstart.replace('T100000Z', 'T110000Z')}\r\n` +
+      `SUMMARY:Quarterly ${s.uid}\r\n` +
+      'RRULE:FREQ=MONTHLY;INTERVAL=3;BYDAY=-1TH\r\n' +
+      'END:VEVENT\r\n' +
+      'END:VCALENDAR\r\n';
+    const createRes = await api
+      .post('/v1/calendar-events')
+      .set('Authorization', auth)
+      .send({ calendar_id: calendarId, ical });
+    t.is(createRes.status, 200, `created ${s.uid}`);
+  }
+
+  // Query: April 30, 2026 — only the July-anchored series fires here.
+  const aprRes = await api
+    .get(
+      '/v1/calendar-events' +
+        `?calendar_id=${calendarId}` +
+        '&start_date=2026-04-30T00:00:00Z' +
+        '&end_date=2026-04-30T23:59:59Z'
+    )
+    .set('Authorization', auth);
+  t.is(aprRes.status, 200);
+  t.true(Array.isArray(aprRes.body));
+  const aprUids = aprRes.body.map((e) => e.uid).sort();
+  t.deepEqual(
+    aprUids,
+    ['jul-anchored@example.com'],
+    'April 30 should only match the July-anchored series'
+  );
+
+  // Query: May 28, 2026 — only the August-anchored series fires here.
+  const mayRes = await api
+    .get(
+      '/v1/calendar-events' +
+        `?calendar_id=${calendarId}` +
+        '&start_date=2026-05-28T00:00:00Z' +
+        '&end_date=2026-05-28T23:59:59Z'
+    )
+    .set('Authorization', auth);
+  t.is(mayRes.status, 200);
+  const mayUids = mayRes.body.map((e) => e.uid).sort();
+  t.deepEqual(
+    mayUids,
+    ['aug-anchored@example.com'],
+    'May 28 should only match the August-anchored series'
+  );
+
+  // Query: March 26, 2026 — only the June-anchored series fires here.
+  const marRes = await api
+    .get(
+      '/v1/calendar-events' +
+        `?calendar_id=${calendarId}` +
+        '&start_date=2026-03-26T00:00:00Z' +
+        '&end_date=2026-03-26T23:59:59Z'
+    )
+    .set('Authorization', auth);
+  t.is(marRes.status, 200);
+  const marUids = marRes.body.map((e) => e.uid).sort();
+  t.deepEqual(
+    marUids,
+    ['jun-anchored@example.com'],
+    'March 26 should only match the June-anchored series'
+  );
+});
+
+// VTODO mirror of the VEVENT regression. The same DTSTART-dropped bug
+// existed in the VTODO branch of calendar-events.js (and caldav-server.js)
+// — fixed by anchoring the rule with VTODO.DTSTART when present.
+test('lists recurring tasks anchored to their own DTSTART, not parse-time', async (t) => {
+  const { api } = t.context;
+  const { alias, domain, pass } = await createTestAlias(t);
+  const auth = createAliasAuth(`${alias.name}@${domain.name}`, pass);
+
+  const calendarRes = await api
+    .post('/v1/calendars')
+    .set('Authorization', auth)
+    .send({ name: 'Recurring Tasks Test' });
+  t.is(calendarRes.status, 200);
+  const calendarId = calendarRes.body.id;
+
+  // Same FREQ=MONTHLY;INTERVAL=3;BYDAY=-1TH shape; phase distinguishes them.
+  const series = [
+    { uid: 'task-jul-anchored', dtstart: '20250731T100000Z' },
+    { uid: 'task-aug-anchored', dtstart: '20250828T100000Z' }
+  ];
+
+  for (const s of series) {
+    const ical =
+      'BEGIN:VCALENDAR\r\n' +
+      'VERSION:2.0\r\n' +
+      'PRODID:-//Forward Email//Test//EN\r\n' +
+      'BEGIN:VTODO\r\n' +
+      `UID:${s.uid}@example.com\r\n` +
+      `DTSTART:${s.dtstart}\r\n` +
+      `DUE:${s.dtstart.replace('T100000Z', 'T110000Z')}\r\n` +
+      `SUMMARY:Quarterly task ${s.uid}\r\n` +
+      'STATUS:NEEDS-ACTION\r\n' +
+      'RRULE:FREQ=MONTHLY;INTERVAL=3;BYDAY=-1TH\r\n' +
+      'END:VTODO\r\n' +
+      'END:VCALENDAR\r\n';
+    const createRes = await api
+      .post('/v1/calendar-events')
+      .set('Authorization', auth)
+      .send({ calendar_id: calendarId, ical });
+    t.is(createRes.status, 200, `created ${s.uid}`);
+  }
+
+  const aprRes = await api
+    .get(
+      '/v1/calendar-events' +
+        `?calendar_id=${calendarId}` +
+        '&start_date=2026-04-30T00:00:00Z' +
+        '&end_date=2026-04-30T23:59:59Z'
+    )
+    .set('Authorization', auth);
+  t.is(aprRes.status, 200);
+  t.deepEqual(
+    aprRes.body.map((e) => e.uid).sort(),
+    ['task-jul-anchored@example.com'],
+    'April 30 should only match the July-anchored task'
+  );
+
+  const mayRes = await api
+    .get(
+      '/v1/calendar-events' +
+        `?calendar_id=${calendarId}` +
+        '&start_date=2026-05-28T00:00:00Z' +
+        '&end_date=2026-05-28T23:59:59Z'
+    )
+    .set('Authorization', auth);
+  t.is(mayRes.status, 200);
+  t.deepEqual(
+    mayRes.body.map((e) => e.uid).sort(),
+    ['task-aug-anchored@example.com'],
+    'May 28 should only match the August-anchored task'
+  );
+});
+
+// VTODO with only DUE (no DTSTART) — RFC 5545 allows recurrence to be
+// anchored to DUE in this shape. The fix in calendar-events.js relabels
+// DUE → DTSTART when feeding rrulestr; this test pins that fallback so
+// a task with only DUE doesn't fall back to parse-time-anchored phase
+// and become non-deterministic.
+test('recurring task with only DUE anchors to DUE, not parse-time', async (t) => {
+  const { api } = t.context;
+  const { alias, domain, pass } = await createTestAlias(t);
+  const auth = createAliasAuth(`${alias.name}@${domain.name}`, pass);
+
+  const calendarRes = await api
+    .post('/v1/calendars')
+    .set('Authorization', auth)
+    .send({ name: 'Due-Only Tasks' });
+  t.is(calendarRes.status, 200);
+  const calendarId = calendarRes.body.id;
+
+  // Anchored only by DUE (Aug 28, 2025). Quarterly last-Thursday cadence.
+  // Expected occurrences: Aug 28 / Nov 27 / Feb 26 2026 / May 28 2026 / ...
+  const ical =
+    'BEGIN:VCALENDAR\r\n' +
+    'VERSION:2.0\r\n' +
+    'PRODID:-//Forward Email//Test//EN\r\n' +
+    'BEGIN:VTODO\r\n' +
+    'UID:due-only-task@example.com\r\n' +
+    'DUE:20250828T100000Z\r\n' +
+    'SUMMARY:Due-only quarterly task\r\n' +
+    'STATUS:NEEDS-ACTION\r\n' +
+    'RRULE:FREQ=MONTHLY;INTERVAL=3;BYDAY=-1TH\r\n' +
+    'END:VTODO\r\n' +
+    'END:VCALENDAR\r\n';
+  const createRes = await api
+    .post('/v1/calendar-events')
+    .set('Authorization', auth)
+    .send({ calendar_id: calendarId, ical });
+  t.is(createRes.status, 200, 'created due-only task');
+
+  // Should match May 28, 2026 (next occurrence after the Aug 2025 anchor).
+  const hitRes = await api
+    .get(
+      '/v1/calendar-events' +
+        `?calendar_id=${calendarId}` +
+        '&start_date=2026-05-28T00:00:00Z' +
+        '&end_date=2026-05-28T23:59:59Z'
+    )
+    .set('Authorization', auth);
+  t.is(hitRes.status, 200);
+  t.is(
+    hitRes.body.length,
+    1,
+    'May 28 should match the August-anchored due-only task'
+  );
+
+  // Should NOT match April 30, 2026 (that's the July-anchored phase, and
+  // this task is anchored to August).
+  const missRes = await api
+    .get(
+      '/v1/calendar-events' +
+        `?calendar_id=${calendarId}` +
+        '&start_date=2026-04-30T00:00:00Z' +
+        '&end_date=2026-04-30T23:59:59Z'
+    )
+    .set('Authorization', auth);
+  t.is(missRes.status, 200);
+  t.is(
+    missRes.body.length,
+    0,
+    'April 30 must not match an August-anchored due-only task'
+  );
+});
+
+// EXDATE handling sanity check — confirms our DTSTART-aware fix doesn't
+// regress the EXDATE filter. Excluding one occurrence should remove
+// only that date from matches.
+test('recurring event with EXDATE filters only the excluded occurrence', async (t) => {
+  const { api } = t.context;
+  const { alias, domain, pass } = await createTestAlias(t);
+  const auth = createAliasAuth(`${alias.name}@${domain.name}`, pass);
+
+  const calendarRes = await api
+    .post('/v1/calendars')
+    .set('Authorization', auth)
+    .send({ name: 'EXDATE Test' });
+  t.is(calendarRes.status, 200);
+  const calendarId = calendarRes.body.id;
+
+  // July-anchored quarterly recurrence; exclude the April 30, 2026 instance.
+  // Expected matches: Jul 31 / Oct 30 / Jan 29 2026 / [skip Apr 30] / Jul 30 2026 / ...
+  const ical =
+    'BEGIN:VCALENDAR\r\n' +
+    'VERSION:2.0\r\n' +
+    'PRODID:-//Forward Email//Test//EN\r\n' +
+    'BEGIN:VEVENT\r\n' +
+    'UID:exdate-test@example.com\r\n' +
+    'DTSTART:20250731T100000Z\r\n' +
+    'DTEND:20250731T110000Z\r\n' +
+    'SUMMARY:Quarterly with skipped April\r\n' +
+    'RRULE:FREQ=MONTHLY;INTERVAL=3;BYDAY=-1TH\r\n' +
+    'EXDATE:20260430T100000Z\r\n' +
+    'END:VEVENT\r\n' +
+    'END:VCALENDAR\r\n';
+  const createRes = await api
+    .post('/v1/calendar-events')
+    .set('Authorization', auth)
+    .send({ calendar_id: calendarId, ical });
+  t.is(createRes.status, 200);
+
+  // April 30 — excluded → must not match.
+  const aprRes = await api
+    .get(
+      '/v1/calendar-events' +
+        `?calendar_id=${calendarId}` +
+        '&start_date=2026-04-30T00:00:00Z' +
+        '&end_date=2026-04-30T23:59:59Z'
+    )
+    .set('Authorization', auth);
+  t.is(aprRes.status, 200);
+  t.is(aprRes.body.length, 0, 'EXDATE should remove the April 30 instance');
+
+  // January 29, 2026 — still in the series → must match.
+  const janRes = await api
+    .get(
+      '/v1/calendar-events' +
+        `?calendar_id=${calendarId}` +
+        '&start_date=2026-01-29T00:00:00Z' +
+        '&end_date=2026-01-29T23:59:59Z'
+    )
+    .set('Authorization', auth);
+  t.is(janRes.status, 200);
+  t.is(janRes.body.length, 1, 'January 29 (non-excluded) should still match');
+});
+
 test('calendar events create validates required fields', async (t) => {
   const { api } = t.context;
   const { alias, domain, pass } = await createTestAlias(t);

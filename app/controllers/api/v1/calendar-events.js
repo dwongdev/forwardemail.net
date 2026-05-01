@@ -279,14 +279,32 @@ async function list(ctx) {
             dtend = dtstart;
           }
 
+          // IMPORTANT: include DTSTART in the rule-set text. Without it,
+          // rrulestr defaults the anchor to `new Date()` (parse-time),
+          // which collapses the INTERVAL phase across all events parsed
+          // in the same request. Symptom: every event with the same RRULE
+          // shape (e.g. FREQ=MONTHLY;INTERVAL=3;BYDAY=-1TH) appears to
+          // expand to the same dates regardless of its true DTSTART.
+          // See test/api/v1-alias-endpoints.js "lists recurring events
+          // anchored to their own DTSTART, not parse-time".
+          const dtstartProp = vevent.getFirstProperty('dtstart');
+          const ruleLines = [];
+          if (dtstartProp) ruleLines.push(dtstartProp.toICALString());
+
           for (const key of ['rrule', 'exrule', 'exdate', 'rdate']) {
             const properties = vevent.getAllProperties(key);
             for (const prop of properties) {
-              lines.push(prop.toICALString());
+              ruleLines.push(prop.toICALString());
             }
           }
 
-          if (lines.length === 0) {
+          // After this point, treat `lines` as the rule-set text for rrule.
+          // Track the original recurrence-only count to preserve the
+          // existing "non-recurring fast path" check.
+          const recurrenceLineCount = ruleLines.length - (dtstartProp ? 1 : 0);
+          lines = ruleLines;
+
+          if (recurrenceLineCount === 0) {
             // Non-recurring event - check if event overlaps with query range
             // Event overlaps if: event_start <= query_end && event_end >= query_start
             const eventOverlaps =
@@ -376,6 +394,26 @@ async function list(ctx) {
                 : null;
             due = due && due instanceof ICAL.Time ? due.toJSDate() : null;
 
+            // Anchor the rule with DTSTART (or DUE if DTSTART is absent —
+            // VTODO recurrence is allowed to be relative to either). See
+            // the matching VEVENT branch above for the full explanation.
+            const dtstartProp = vtodo.getFirstProperty('dtstart');
+            const dueProp = vtodo.getFirstProperty('due');
+            const anchorProp = dtstartProp || dueProp;
+            if (anchorProp) {
+              // ical.js stores DUE separately; rrule expects a DTSTART
+              // line, so we relabel a DUE anchor as DTSTART for the rule
+              // text. The original VTODO is unchanged.
+              const anchorLine = anchorProp.toICALString();
+              lines.push(
+                anchorProp.name === 'due'
+                  ? anchorLine.replace(/^DUE/, 'DTSTART')
+                  : anchorLine
+              );
+            }
+
+            const recurrenceStartCount = lines.length;
+
             // Collect recurrence rules for tasks (if any)
             for (const key of ['rrule', 'exrule', 'exdate', 'rdate']) {
               const properties = vtodo.getAllProperties(key);
@@ -384,7 +422,9 @@ async function list(ctx) {
               }
             }
 
-            if (lines.length === 0) {
+            const recurrenceLineCount = lines.length - recurrenceStartCount;
+
+            if (recurrenceLineCount === 0) {
               // Non-recurring task - check date ranges
               // For tasks, we need to be more flexible with date matching
               const taskStart = dtstart;

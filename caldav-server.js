@@ -2478,6 +2478,15 @@ class CalDAV extends API {
         let dtend = vevent.getFirstPropertyValue('dtend');
         dtend = dtend && dtend instanceof ICAL.Time ? dtend.toJSDate() : null;
 
+        // IMPORTANT: include DTSTART in the rule-set text. Without it,
+        // rrulestr defaults the anchor to `new Date()` and INTERVAL phase
+        // collapses across all events parsed in this request — producing
+        // false matches and false misses on time-range queries. Mirrors
+        // the equivalent fix in app/controllers/api/v1/calendar-events.js.
+        const dtstartProp = vevent.getFirstProperty('dtstart');
+        if (dtstartProp) lines.push(dtstartProp.toICALString());
+        const recurrenceStartCount = lines.length;
+
         for (const key of ['rrule', 'exrule', 'exdate', 'rdate']) {
           const properties = vevent.getAllProperties(key);
           for (const prop of properties) {
@@ -2485,7 +2494,9 @@ class CalDAV extends API {
           }
         }
 
-        if (lines.length === 0) {
+        const recurrenceLineCount = lines.length - recurrenceStartCount;
+
+        if (recurrenceLineCount === 0) {
           // Non-recurring legacy event without dtstart/dtend in DB
           if (
             (!start || (dtend && start <= dtend)) &&
@@ -2587,6 +2598,25 @@ class CalDAV extends API {
             dtstart && dtstart instanceof ICAL.Time ? dtstart.toJSDate() : null;
           due = due && due instanceof ICAL.Time ? due.toJSDate() : null;
 
+          // Anchor the rule with DTSTART (or DUE if DTSTART is absent).
+          // Without an anchor line, rrulestr falls back to parse-time as
+          // the start, which collapses INTERVAL phase across all
+          // recurring tasks in the request. Mirrors the matching fix in
+          // app/controllers/api/v1/calendar-events.js.
+          const dtstartProp = vtodo.getFirstProperty('dtstart');
+          const dueProp = vtodo.getFirstProperty('due');
+          const anchorProp = dtstartProp || dueProp;
+          if (anchorProp) {
+            const anchorLine = anchorProp.toICALString();
+            lines.push(
+              anchorProp.name === 'due'
+                ? anchorLine.replace(/^DUE/, 'DTSTART')
+                : anchorLine
+            );
+          }
+
+          const recurrenceStartCount = lines.length;
+
           // Collect recurrence rules for tasks (if any)
           for (const key of ['rrule', 'exrule', 'exdate', 'rdate']) {
             const properties = vtodo.getAllProperties(key);
@@ -2595,7 +2625,9 @@ class CalDAV extends API {
             }
           }
 
-          if (lines.length === 0) {
+          const recurrenceLineCount = lines.length - recurrenceStartCount;
+
+          if (recurrenceLineCount === 0) {
             // Non-recurring task - check date ranges
             // For tasks, we need to be more flexible with date matching
             // VTODO can have: DTSTART+DUE, just DUE, or just DTSTART
