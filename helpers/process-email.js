@@ -1333,9 +1333,23 @@ async function processEmail({ email, port = 25, resolver, client }) {
       //
     }
 
+    // preserve in-memory deliveries before re-fetching the document
+    const pendingDeliveries = Array.isArray(email.deliveries)
+      ? [...email.deliveries]
+      : [];
+
     // lookup the email by id to get most recent data and version key (`__v`)
     email = await Emails.findById(email._id);
     if (!email) throw new Error('Email does not exist');
+
+    // merge in-memory deliveries onto the freshly-fetched document
+    // NOTE: we must use direct assignment (not push) to avoid a Mongoose 6
+    // internal atomics tracking bug that surfaces when pushing onto an array
+    // of a freshly-fetched document before calling save().
+    if (pendingDeliveries.length > 0) {
+      const existing = Array.isArray(email.deliveries) ? email.deliveries : [];
+      email.set('deliveries', [...existing, ...pendingDeliveries]);
+    }
 
     //
     // update `accepted` array

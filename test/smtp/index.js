@@ -5070,3 +5070,218 @@ Test message for RFC 3464 success DSN compliance`.trim()
   await server.close();
   await smtp.close();
 });
+
+test('deliveries array is populated with transport metadata after successful send', async (t) => {
+  const user = await t.context.userFactory
+    .withState({
+      plan: 'enhanced_protection',
+      [config.userFields.planSetAt]: dayjs().startOf('day').toDate()
+    })
+    .create();
+
+  await t.context.paymentFactory
+    .withState({
+      user: user._id,
+      amount: 300,
+      invoice_at: dayjs().startOf('day').toDate(),
+      method: 'free_beta_program',
+      duration: ms('30d'),
+      plan: user.plan,
+      kind: 'one-time'
+    })
+    .create();
+
+  await user.save();
+
+  const resolver = createTangerine(t.context.client, logger);
+
+  const domain = await t.context.domainFactory
+    .withState({
+      members: [{ user: user._id, group: 'admin' }],
+      plan: user.plan,
+      has_smtp: true,
+      resolver
+    })
+    .create();
+
+  const alias = await t.context.aliasFactory
+    .withState({
+      user: user._id,
+      domain: domain._id,
+      recipients: [user.email]
+    })
+    .create();
+
+  const map = new Map();
+
+  // spoof recipient MX records
+  map.set(
+    'mx:foo.com',
+    resolver.spoofPacket(
+      'foo.com',
+      'MX',
+      [{ exchange: IP_ADDRESS, priority: 0 }],
+      true,
+      ms('5m')
+    )
+  );
+
+  map.set(
+    `txt:${domain.name}`,
+    resolver.spoofPacket(
+      domain.name,
+      'TXT',
+      [`${config.paidPrefix}${domain.verification_record}`],
+      true
+    )
+  );
+
+  // dkim
+  map.set(
+    `txt:${domain.dkim_key_selector}._domainkey.${domain.name}`,
+    resolver.spoofPacket(
+      `${domain.dkim_key_selector}._domainkey.${domain.name}`,
+      'TXT',
+      [`v=DKIM1; k=rsa; p=${domain.dkim_public_key.toString('base64')};`],
+      true
+    )
+  );
+
+  // spf
+  map.set(
+    `txt:${env.WEB_HOST}`,
+    resolver.spoofPacket(
+      `${env.WEB_HOST}`,
+      'TXT',
+      [`v=spf1 ip4:${IP_ADDRESS} -all`],
+      true,
+      ms('5m')
+    )
+  );
+
+  // cname
+  map.set(
+    `cname:${domain.return_path}.${domain.name}`,
+    resolver.spoofPacket(
+      `${domain.return_path}.${domain.name}`,
+      'CNAME',
+      [env.WEB_HOST],
+      true
+    )
+  );
+
+  // cname -> txt
+  map.set(
+    `txt:${domain.return_path}.${domain.name}`,
+    resolver.spoofPacket(
+      `${domain.return_path}.${domain.name}`,
+      'TXT',
+      [`v=spf1 ip4:${IP_ADDRESS} -all`],
+      true,
+      ms('5m')
+    )
+  );
+
+  // dmarc
+  map.set(
+    `txt:_dmarc.${domain.name}`,
+    resolver.spoofPacket(
+      `_dmarc.${domain.name}`,
+      'TXT',
+      [
+        `v=DMARC1; p=reject; pct=100; rua=mailto:dmarc-${domain.id}@forwardemail.net;`
+      ],
+      true
+    )
+  );
+
+  await resolver.options.cache.mset(map);
+
+  const email = await Emails.queue({
+    message: {
+      from: `${alias.name}@${domain.name}`,
+      to: 'test@foo.com',
+      subject: 'test deliveries',
+      text: 'test'
+    },
+    user: user._id
+  });
+
+  t.true(Array.isArray(email.deliveries));
+  t.is(email.deliveries.length, 0);
+
+  if (!getPort) await pWaitFor(() => Boolean(getPort), { timeout: ms('30s') });
+  const testPort = await getPort();
+  const server = new SMTPServer({
+    disabledCommands: ['AUTH'],
+    onRcptTo(address, session, fn) {
+      fn();
+    },
+    onConnect(session, fn) {
+      fn();
+    },
+    onData(stream, session, fn) {
+      const chunks = [];
+      const writer = new Writable({
+        write(chunk, encoding, fn) {
+          chunks.push(chunk);
+          fn();
+        }
+      });
+      stream.pipe(writer);
+      stream.on('end', () => {
+        fn();
+      });
+    },
+    logger,
+    secure: false
+  });
+
+  await pify(server.listen.bind(server))(testPort);
+
+  await processEmail({
+    email,
+    port: testPort,
+    resolver,
+    client
+  });
+
+  // fetch the updated email document
+  const updatedEmail = await Emails.findById(email._id).lean().exec();
+
+  // email should be fully sent
+  t.is(updatedEmail.status, 'sent');
+  t.deepEqual(updatedEmail.accepted, ['test@foo.com']);
+
+  // deliveries array must be populated with one entry per accepted recipient
+  t.true(Array.isArray(updatedEmail.deliveries));
+  t.is(updatedEmail.deliveries.length, 1);
+
+  const delivery = updatedEmail.deliveries[0];
+
+  // recipient
+  t.is(delivery.recipient, 'test@foo.com');
+
+  // date must be a valid Date
+  t.true(delivery.date instanceof Date || typeof delivery.date === 'string');
+
+  // response and responseCode from the receiving server
+  t.is(typeof delivery.response, 'string');
+  t.is(typeof delivery.responseCode, 'number');
+  t.is(delivery.responseCode, 250);
+
+  // MX metadata must be present
+  t.truthy(delivery.mx);
+  t.is(typeof delivery.mx.host, 'string');
+  t.is(typeof delivery.mx.port, 'number');
+
+  // TLS policy flags must be booleans
+  t.is(typeof delivery.requireTLS, 'boolean');
+  t.is(typeof delivery.ignoreTLS, 'boolean');
+  t.is(typeof delivery.opportunisticTLS, 'boolean');
+
+  // dkim must be true (sendEmail always signs)
+  t.true(delivery.dkim);
+
+  await server.close();
+});

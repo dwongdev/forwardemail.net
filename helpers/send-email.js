@@ -399,6 +399,7 @@ async function sendEmail(
     });
     info.pgp = pgpResults.pgp;
     info.smime = pgpResults.smime;
+    info.session = session;
     logger.info('delivered', {
       info,
       ignore_hook: false,
@@ -599,6 +600,7 @@ async function sendEmail(
         });
         info.pgp = pgpResults.pgp;
         info.smime = pgpResults.smime;
+        info.session = session;
         logger.info('delivered', {
           info,
           ignore_hook: false,
