@@ -119,7 +119,7 @@ get_recent_sudo_commands() {
         awk -v start="$start_date" '
             BEGIN { found=0 }
             $0 ~ start { found=1 }
-            found && /sudo:/ && /COMMAND=/ {
+            found && /sudo:/ && /COMMAND=/ && !/pm2 jlist/ {
                 for(i=1;i<=NF;i++) {
                     if($i ~ /^USER=/) {
                         user=$i;

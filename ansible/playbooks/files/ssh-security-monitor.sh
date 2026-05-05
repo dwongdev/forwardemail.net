@@ -492,8 +492,8 @@ main() {
     analyze_recent_commands "$new_entries"
 
     # Count activity for summary
-    local successful_count=$(echo "$new_entries" | grep -cE "sshd.*Accepted" 2>/dev/null || echo 0)
-    local failed_count=$(echo "$new_entries" | grep -cE "sshd.*(Failed|Invalid)" 2>/dev/null || echo 0)
+    local successful_count=$(echo "$new_entries" | grep -E "sshd.*Accepted" 2>/dev/null | wc -l)
+    local failed_count=$(echo "$new_entries" | grep -E "sshd.*(Failed|Invalid)" 2>/dev/null | wc -l)
     local logged_in_users=$(who)
 
     # Send periodic activity summary

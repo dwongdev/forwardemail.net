@@ -410,7 +410,8 @@
               fi
 
               # Display uptime for all processes
-              echo "$PM2_JSON" | jq -r '.[] | "\(.name): \(.pm2_env.status) (uptime: \(.pm2_env.pm_uptime | tonumber / 1000 | floor) seconds)"'
+              local NOW_MS; NOW_MS=$(date +%s%3N)
+              echo "$PM2_JSON" | jq -r --arg now "$NOW_MS" '.[] | "\(.name): \(.pm2_env.status) (uptime: \(($now | tonumber - (.pm2_env.pm_uptime | tonumber)) / 1000 | floor) seconds)"'
             fi
 
             # Check if saved process list differs from current
