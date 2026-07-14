@@ -3,13 +3,15 @@
  * SPDX-License-Identifier: BUSL-1.1
  */
 
-const { Buffer } = require('node:buffer');
 const { readFileSync } = require('node:fs');
 const process = require('node:process');
 
+const apn = require('@parse/node-apn');
+const { GoogleAuth } = require('google-auth-library');
 const ms = require('ms');
 const pMap = require('p-map');
 const revHash = require('rev-hash');
+const webPush = require('web-push');
 
 const PushTokens = require('#models/push-tokens');
 const config = require('#config');
@@ -34,8 +36,8 @@ const safeFetch = require('#helpers/safe-fetch');
 // Delivery transports:
 //   * APNs  — via token-based auth (.p8 key) with pushType='alert'.
 //   * FCM   — via Firebase Admin SDK HTTP v1 API.
-//   * UnifiedPush — via plain HTTPS POST to the distributor endpoint.
-//   * Web Push — via web-push library (future).
+//   * UnifiedPush — RFC 8291 encrypted Web Push to the distributor endpoint.
+//   * Web Push — reserved for browser PushSubscription delivery.
 //
 // Rate limiting:
 //   One push per (alias, event) per 30 seconds via Redis to coalesce
@@ -110,6 +112,36 @@ function isFcmConfigured() {
   return Boolean(projectId && serviceAccountPath);
 }
 
+/**
+ * Returns true if the matching UnifiedPush VAPID key pair is configured.
+ */
+function isVapidConfigured() {
+  const subject =
+    config.pushNotifications?.vapidSubject || process.env.VAPID_SUBJECT;
+  const publicKey =
+    config.pushNotifications?.vapidPublicKey || process.env.VAPID_PUBLIC_KEY;
+  const privateKey =
+    config.pushNotifications?.vapidPrivateKey || process.env.VAPID_PRIVATE_KEY;
+  return Boolean(subject && publicKey && privateKey);
+}
+
+function getVapidDetails() {
+  return {
+    subject:
+      config.pushNotifications?.vapidSubject || process.env.VAPID_SUBJECT,
+    publicKey:
+      config.pushNotifications?.vapidPublicKey || process.env.VAPID_PUBLIC_KEY,
+    privateKey:
+      config.pushNotifications?.vapidPrivateKey || process.env.VAPID_PRIVATE_KEY
+  };
+}
+
+function createPermanentPushError(message, cause) {
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.isPermanentPushFailure = true;
+  return error;
+}
+
 // Cached APNs provider (reused across requests to avoid connection churn)
 let _apnsProvider = null;
 let _apnsProviderConfig = null;
@@ -119,8 +151,6 @@ let _apnsProviderConfig = null;
  * Recreated if configuration changes.
  */
 function getApnsProvider() {
-  const apn = require('@parse/node-apn');
-
   const keyPath =
     config.pushNotifications?.apnsKeyPath || process.env.APNS_KEY_PATH;
   const keyId = config.pushNotifications?.apnsKeyId || process.env.APNS_KEY_ID;
@@ -204,7 +234,9 @@ async function sendPushNotification(
             platform: tokenDoc.platform,
             error: err.message
           });
-          await PushTokens.recordFailure(tokenDoc._id);
+          await (err.isPermanentPushFailure
+            ? PushTokens.deleteOne({ _id: tokenDoc._id }).exec()
+            : PushTokens.recordFailure(tokenDoc._id));
         }
       },
       { concurrency: PUSH_CONCURRENCY }
@@ -248,30 +280,13 @@ function buildPayload(event, data) {
 
   // Sanitize body: truncate to prevent oversized payloads
   const MAX_BODY_LENGTH = 256;
-  let body = '';
-  switch ('string') {
-    case typeof data.body: {
-      body = data.body.slice(0, MAX_BODY_LENGTH);
-
-      break;
-    }
-
-    case typeof data.subject: {
-      body = data.subject.slice(0, MAX_BODY_LENGTH);
-
-      break;
-    }
-
-    case typeof data.name: {
-      body = data.name.slice(0, MAX_BODY_LENGTH);
-
-      break;
-    }
-
-    default: {
-      body = `You have a new ${event} event`;
-    }
-  }
+  const bodySource = [data.body, data.subject, data.name].find(
+    (value) => typeof value === 'string'
+  );
+  const body =
+    typeof bodySource === 'string'
+      ? bodySource.slice(0, MAX_BODY_LENGTH)
+      : `You have a new ${event} event`;
 
   // Sanitize data fields: only include known safe identifiers
   const safeAliasId =
@@ -342,10 +357,11 @@ async function deliverApns(tokenDoc, payload) {
     return;
   }
 
-  const apn = require('@parse/node-apn');
   const provider = getApnsProvider();
   const bundleId =
-    config.pushNotifications?.apnsBundleId || 'net.forwardemail.app';
+    config.pushNotifications?.apnsBundleId ||
+    process.env.APNS_BUNDLE_ID ||
+    'net.forwardemail.mail';
 
   const note = new apn.Notification();
   note.pushType = 'alert';
@@ -388,8 +404,6 @@ async function deliverFcm(tokenDoc, payload) {
     return;
   }
 
-  const { GoogleAuth } = require('google-auth-library');
-
   const projectId =
     config.pushNotifications?.fcmProjectId || process.env.FCM_PROJECT_ID;
   const serviceAccountPath =
@@ -423,7 +437,7 @@ async function deliverFcm(tokenDoc, payload) {
       ),
       android: {
         priority: 'high',
-        notification: { channel_id: 'email_notifications' }
+        notification: { channel_id: 'mail_notifications' }
       }
     }
   };
@@ -455,24 +469,76 @@ async function deliverFcm(tokenDoc, payload) {
 }
 
 /**
- * UnifiedPush delivery via plain HTTPS POST.
- *
- * The UnifiedPush spec requires a simple POST to the endpoint URL
- * with the notification payload as the body.
- * <https://unifiedpush.org/spec/server/>
- *
- * No env var configuration needed — the endpoint URL is the token itself.
+ * Parse the canonical RFC 8291 subscription stored for UnifiedPush.
+ * Legacy endpoint-only records are intentionally treated as permanently
+ * invalid because they do not contain the client key material required to
+ * encrypt a payload.
  */
-async function deliverUnifiedPush(tokenDoc, payload, resolver) {
-  const endpointUrl = tokenDoc.token;
-  // Validate URL scheme and credentials before making the request
-  const parsed = new URL(endpointUrl);
+function parseUnifiedPushSubscription(token) {
+  let subscription;
+  try {
+    subscription = JSON.parse(token);
+  } catch (err) {
+    throw createPermanentPushError(
+      'UnifiedPush subscription is not valid JSON',
+      err
+    );
+  }
+
+  if (
+    !subscription ||
+    typeof subscription.endpoint !== 'string' ||
+    !subscription.keys ||
+    typeof subscription.keys.p256dh !== 'string' ||
+    typeof subscription.keys.auth !== 'string'
+  ) {
+    throw createPermanentPushError('UnifiedPush subscription is incomplete');
+  }
+
+  return {
+    endpoint: subscription.endpoint,
+    keys: {
+      p256dh: subscription.keys.p256dh,
+      auth: subscription.keys.auth
+    }
+  };
+}
+
+/**
+ * Deliver an RFC 8291 encrypted payload to a UnifiedPush distributor.
+ *
+ * Android's UnifiedPush connector decrypts the aes128gcm content before the
+ * application callback receives it. VAPID binds delivery to the application
+ * server key whose public half was supplied during connector registration.
+ * The encrypted request is sent through safeFetch so DNS is resolved once,
+ * validated, and pinned to the outbound connection.
+ */
+async function deliverUnifiedPush(
+  tokenDoc,
+  payload,
+  resolver,
+  {
+    generateRequestDetails = webPush.generateRequestDetails,
+    fetch = safeFetch
+  } = {}
+) {
+  if (!isVapidConfigured()) {
+    logger.debug('VAPID not configured, skipping UnifiedPush delivery');
+    return;
+  }
+
+  const subscription = parseUnifiedPushSubscription(tokenDoc.token);
+  const parsed = new URL(subscription.endpoint);
   if (parsed.protocol !== 'https:') {
-    throw new Error('Only HTTPS URLs are allowed for push delivery');
+    throw createPermanentPushError(
+      'Only HTTPS URLs are allowed for push delivery'
+    );
   }
 
   if (parsed.username || parsed.password) {
-    throw new Error('Push endpoint must not contain credentials');
+    throw createPermanentPushError(
+      'Push endpoint must not contain credentials'
+    );
   }
 
   const body = JSON.stringify({
@@ -482,27 +548,48 @@ async function deliverUnifiedPush(tokenDoc, payload, resolver) {
     ...payload.data
   });
 
-  // Use safeFetch with DNS pinning to prevent TOCTOU DNS rebinding attacks.
-  // safeFetch resolves the hostname ONCE, validates it is not a private IP,
-  // then pins the resolved IP at the connection level via a custom undici
-  // Agent — eliminating the window between DNS check and TCP connect.
-  const { statusCode, body: responseBody } = await safeFetch(endpointUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': String(Buffer.byteLength(body))
-    },
-    body,
-    bodyTimeout: 10_000,
-    headersTimeout: 10_000,
-    resolver
-  });
+  try {
+    const request = generateRequestDetails(subscription, body, {
+      TTL: 60,
+      urgency: 'high',
+      contentEncoding: 'aes128gcm',
+      vapidDetails: getVapidDetails()
+    });
+    const response = await fetch(request.endpoint, {
+      method: request.method,
+      headers: request.headers,
+      body: request.body,
+      bodyTimeout: 10_000,
+      headersTimeout: 10_000,
+      resolver
+    });
+    const responseBody = await response.body.text();
 
-  if (statusCode < 200 || statusCode >= 300) {
-    const text = await responseBody.text();
-    throw new Error(
-      `UnifiedPush delivery failed (${statusCode}): ${text.slice(0, 200)}`
-    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      const error = new Error('UnifiedPush endpoint returned an error');
+      error.statusCode = response.statusCode;
+      error.body = responseBody;
+      throw error;
+    }
+
+    return { statusCode: response.statusCode };
+  } catch (err) {
+    const statusCode = Number(err.statusCode);
+    const details =
+      typeof err.body === 'string' && err.body
+        ? `: ${err.body.slice(0, 200)}`
+        : '';
+    const message = `UnifiedPush delivery failed (${
+      statusCode || 'network'
+    })${details}`;
+
+    // RFC 8030: 404/410 mean the subscription is no longer valid and must not
+    // be retried. Other statuses retain the normal consecutive-failure policy.
+    if (statusCode === 404 || statusCode === 410) {
+      throw createPermanentPushError(message, err);
+    }
+
+    throw new Error(message, { cause: err });
   }
 }
 
@@ -527,7 +614,10 @@ module.exports._test = {
   deliverFcm,
   deliverUnifiedPush,
   deliverWebPush,
+  parseUnifiedPushSubscription,
   isApnsConfigured,
   isFcmConfigured,
+  isVapidConfigured,
+  getVapidDetails,
   validateOutboundUrl
 };

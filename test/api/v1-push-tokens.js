@@ -29,6 +29,18 @@ function createApiTokenAuth(apiToken) {
   return `Basic ${Buffer.from(`${apiToken}:`).toString('base64')}`;
 }
 
+function createUnifiedPushSubscription(
+  endpoint = 'https://ntfy.example.com/up-test-endpoint'
+) {
+  return JSON.stringify({
+    endpoint,
+    keys: {
+      p256dh: `B${'A'.repeat(86)}`,
+      auth: 'A'.repeat(22)
+    }
+  });
+}
+
 async function createTestAlias(t) {
   let user = await t.context.userFactory
     .withState({
@@ -132,22 +144,57 @@ test('POST /v1/push-tokens > registers FCM token with API token auth', async (t)
   t.is(res.body.device_name, 'Test Pixel');
 });
 
-test('POST /v1/push-tokens > registers UnifiedPush endpoint', async (t) => {
+test('POST /v1/push-tokens > registers encrypted UnifiedPush subscription', async (t) => {
   const { domain, alias, pass } = await createTestAlias(t);
   const aliasEmail = `${alias.name}@${domain.name}`;
+  const token = createUnifiedPushSubscription();
 
   const res = await t.context.api
     .post('/v1/push-tokens')
     .set('Authorization', createAliasAuth(aliasEmail, pass))
     .send({
       platform: 'unified-push',
-      token: 'https://ntfy.example.com/up-test-endpoint',
+      token,
       device_name: 'GrapheneOS'
     });
 
   t.is(res.status, 201);
   t.is(res.body.platform, 'unified-push');
-  t.is(res.body.token, 'https://ntfy.example.com/up-test-endpoint');
+  t.is(res.body.token, token);
+});
+
+test('POST /v1/push-tokens > canonicalizes UnifiedPush subscription', async (t) => {
+  const { domain, alias, pass } = await createTestAlias(t);
+  const aliasEmail = `${alias.name}@${domain.name}`;
+  const token = JSON.stringify({
+    ignored: 'not persisted',
+    keys: { auth: 'A'.repeat(22), p256dh: `B${'A'.repeat(86)}` },
+    endpoint: 'https://ntfy.example.com/up-test-endpoint'
+  });
+
+  const res = await t.context.api
+    .post('/v1/push-tokens')
+    .set('Authorization', createAliasAuth(aliasEmail, pass))
+    .send({ platform: 'unified-push', token });
+
+  t.is(res.status, 201);
+  t.is(res.body.token, createUnifiedPushSubscription());
+});
+
+test('POST /v1/push-tokens > accepts self-hosted distributor HTTPS port', async (t) => {
+  const { domain, alias, pass } = await createTestAlias(t);
+  const aliasEmail = `${alias.name}@${domain.name}`;
+  const token = createUnifiedPushSubscription(
+    'https://push.example.com:8443/endpoint/device-1'
+  );
+
+  const res = await t.context.api
+    .post('/v1/push-tokens')
+    .set('Authorization', createAliasAuth(aliasEmail, pass))
+    .send({ platform: 'unified-push', token });
+
+  t.is(res.status, 201);
+  t.is(res.body.token, token);
 });
 
 test('POST /v1/push-tokens > upserts existing token (extends expiry)', async (t) => {
@@ -251,11 +298,59 @@ test('POST /v1/push-tokens > rejects non-HTTPS UnifiedPush endpoint', async (t) 
     .set('Authorization', createAliasAuth(aliasEmail, pass))
     .send({
       platform: 'unified-push',
-      token: 'http://insecure.example.com/push'
+      token: createUnifiedPushSubscription('http://insecure.example.com/push')
     });
 
   t.is(res.status, 400);
   t.regex(res.body.message, /https/i);
+});
+
+test('POST /v1/push-tokens > rejects endpoint-only UnifiedPush token', async (t) => {
+  const { domain, alias, pass } = await createTestAlias(t);
+  const aliasEmail = `${alias.name}@${domain.name}`;
+
+  const res = await t.context.api
+    .post('/v1/push-tokens')
+    .set('Authorization', createAliasAuth(aliasEmail, pass))
+    .send({
+      platform: 'unified-push',
+      token: 'https://ntfy.example.com/up-test-endpoint'
+    });
+
+  t.is(res.status, 400);
+});
+
+test('POST /v1/push-tokens > rejects UnifiedPush subscription without encryption keys', async (t) => {
+  const { domain, alias, pass } = await createTestAlias(t);
+  const aliasEmail = `${alias.name}@${domain.name}`;
+
+  const res = await t.context.api
+    .post('/v1/push-tokens')
+    .set('Authorization', createAliasAuth(aliasEmail, pass))
+    .send({
+      platform: 'unified-push',
+      token: JSON.stringify({
+        endpoint: 'https://ntfy.example.com/up-test-endpoint'
+      })
+    });
+
+  t.is(res.status, 400);
+});
+
+test('POST /v1/push-tokens > rejects invalid UnifiedPush key lengths', async (t) => {
+  const { domain, alias, pass } = await createTestAlias(t);
+  const aliasEmail = `${alias.name}@${domain.name}`;
+  const token = JSON.stringify({
+    endpoint: 'https://ntfy.example.com/up-test-endpoint',
+    keys: { p256dh: 'too-short', auth: 'also-too-short' }
+  });
+
+  const res = await t.context.api
+    .post('/v1/push-tokens')
+    .set('Authorization', createAliasAuth(aliasEmail, pass))
+    .send({ platform: 'unified-push', token });
+
+  t.is(res.status, 400);
 });
 
 test('POST /v1/push-tokens > rejects invalid web-push subscription', async (t) => {

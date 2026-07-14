@@ -48,11 +48,11 @@ const PushTokens = new mongoose.Schema({
   },
 
   //
-  // The device token or push endpoint URL.
+  // The platform token or serialized push subscription.
   //
   //   * apns:         hex device token (64–200 chars)
   //   * fcm:          FCM registration token (string)
-  //   * unified-push: full HTTPS endpoint URL from the distributor
+  //   * unified-push: JSON-encoded RFC 8291 subscription (endpoint + keys)
   //   * web-push:     JSON-encoded PushSubscription object
   //
   token: {

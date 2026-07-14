@@ -706,18 +706,22 @@ const config = {
 
   //
   // Push notification configuration
-  // Used by helpers/send-push-notification.js for APNs/FCM delivery
+  // Used by helpers/send-push-notification.js for APNs, FCM, and UnifiedPush delivery
   //
   pushNotifications: {
     // APNs (Apple Push Notification service)
-    apnsBundleId: env.APNS_BUNDLE_ID || 'net.forwardemail.app',
+    apnsBundleId: env.APNS_BUNDLE_ID || 'net.forwardemail.mail',
     apnsKeyId: env.APNS_KEY_ID || '',
     apnsTeamId: env.APNS_TEAM_ID || '',
     apnsKeyPath: env.APNS_KEY_PATH || '',
     apnsProduction: env.APNS_PRODUCTION === 'true',
     // FCM (Firebase Cloud Messaging)
     fcmProjectId: env.FCM_PROJECT_ID || '',
-    fcmServiceAccountPath: env.FCM_SERVICE_ACCOUNT_PATH || ''
+    fcmServiceAccountPath: env.FCM_SERVICE_ACCOUNT_PATH || '',
+    // UnifiedPush/Web Push encryption and application-server identity
+    vapidSubject: env.VAPID_SUBJECT || '',
+    vapidPublicKey: env.VAPID_PUBLIC_KEY || '',
+    vapidPrivateKey: env.VAPID_PRIVATE_KEY || ''
   },
 
   WS_TRUST_PROXY: boolean(env.WS_TRUST_PROXY),

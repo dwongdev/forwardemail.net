@@ -19697,5 +19697,6 @@
   "Disable WKD Lookup": "Disable WKD Lookup",
   "Check this to prevent automatic Web Key Directory (WKD) public key lookups for this alias. When checked, inbound emails will not be encrypted via WKD even if a public key is published.": "Check this to prevent automatic Web Key Directory (WKD) public key lookups for this alias. When checked, inbound emails will not be encrypted via WKD even if a public key is published.",
   "IMAP must be enabled to use webmail": "IMAP must be enabled to use webmail",
-  "IMAP must be enabled to use Sieve scripts": "IMAP must be enabled to use Sieve scripts"
+  "IMAP must be enabled to use Sieve scripts": "IMAP must be enabled to use Sieve scripts",
+  "Only HTTPS URLs are allowed.": "Only HTTPS URLs are allowed."
 }

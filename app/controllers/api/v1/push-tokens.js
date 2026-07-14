@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: BUSL-1.1
  */
 
+const { Buffer } = require('node:buffer');
+
 const Boom = require('@hapi/boom');
 const isSANB = require('is-string-and-not-blank');
 const mongoose = require('mongoose');
@@ -28,8 +30,11 @@ const APNS_TOKEN_REGEX = /^[\da-f]{64,200}$/i;
 // FCM tokens are opaque strings, typically ~150-250 chars
 const FCM_TOKEN_MIN_LENGTH = 32;
 
-// UnifiedPush endpoints must be valid HTTPS URLs
-const UNIFIED_PUSH_URL_REGEX = /^https:\/\/.+/i;
+// UnifiedPush uses an RFC 8291 Web Push subscription.  The connector emits
+// unpadded base64url values: 65-byte uncompressed P-256 key (87 chars) and
+// 16-byte authentication secret (22 chars).
+const UNIFIED_PUSH_P256DH_REGEX = /^[\w-]{87}$/;
+const UNIFIED_PUSH_AUTH_REGEX = /^[\w-]{22}$/;
 
 /**
  * Validate a URL is safe for outbound requests (not SSRF).
@@ -58,6 +63,12 @@ function validateUrlNotPrivate(ctx, urlString) {
     throw Boom.badRequest(ctx.translateError('PUSH_TOKEN_HTTPS_REQUIRED'));
   }
 
+  // URL fragments are never sent in HTTP requests and therefore cannot be
+  // part of a usable push endpoint capability URL.
+  if (parsed.hash) {
+    throw Boom.badRequest(ctx.translateError('PUSH_TOKEN_INVALID_URL'));
+  }
+
   // Use the shared isPrivateHost helper (covers all private/reserved ranges,
   // cloud metadata hostnames, and reserved TLDs)
   if (isPrivateHost(parsed.hostname)) {
@@ -69,12 +80,69 @@ function validateUrlNotPrivate(ctx, urlString) {
     throw Boom.badRequest(ctx.translateError('PUSH_TOKEN_URL_CREDENTIALS'));
   }
 
-  // Block non-standard ports commonly used for internal services
-  if (parsed.port && !['443', ''].includes(parsed.port)) {
+  // Custom HTTPS ports are valid for self-hosted UnifiedPush distributors.
+  // Delivery performs DNS resolution immediately before the outbound request
+  // and rejects private/reserved destinations, including DNS rebinding.
+  return parsed;
+}
+
+/**
+ * Parse and canonicalize an encrypted UnifiedPush subscription.
+ *
+ * @returns {string} deterministic JSON used for both uniqueness and delivery
+ */
+function normalizeUnifiedPushSubscription(ctx, token) {
+  let parsed;
+  try {
+    parsed = JSON.parse(token);
+  } catch {
     throw Boom.badRequest(
-      ctx.translateError('PUSH_TOKEN_URL_NONSTANDARD_PORT')
+      ctx.translateError('PUSH_TOKEN_UNIFIED_PUSH_INVALID')
     );
   }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw Boom.badRequest(
+      ctx.translateError('PUSH_TOKEN_UNIFIED_PUSH_INVALID')
+    );
+  }
+
+  if (!isSANB(parsed.endpoint)) {
+    throw Boom.badRequest(
+      ctx.translateError('PUSH_TOKEN_UNIFIED_PUSH_INVALID')
+    );
+  }
+
+  if (!parsed.keys || typeof parsed.keys !== 'object') {
+    throw Boom.badRequest(
+      ctx.translateError('PUSH_TOKEN_UNIFIED_PUSH_INVALID')
+    );
+  }
+
+  const { p256dh, auth } = parsed.keys;
+  const p256dhBytes =
+    isSANB(p256dh) && UNIFIED_PUSH_P256DH_REGEX.test(p256dh)
+      ? Buffer.from(p256dh, 'base64url')
+      : null;
+  const authBytes =
+    isSANB(auth) && UNIFIED_PUSH_AUTH_REGEX.test(auth)
+      ? Buffer.from(auth, 'base64url')
+      : null;
+  if (
+    !p256dhBytes ||
+    p256dhBytes.length !== 65 ||
+    p256dhBytes[0] !== 4 ||
+    !authBytes ||
+    authBytes.length !== 16
+  ) {
+    throw Boom.badRequest(
+      ctx.translateError('PUSH_TOKEN_UNIFIED_PUSH_INVALID')
+    );
+  }
+
+  const endpoint = validateUrlNotPrivate(ctx, parsed.endpoint).href;
+
+  return JSON.stringify({ endpoint, keys: { p256dh, auth } });
 }
 
 /**
@@ -117,15 +185,7 @@ function validateToken(ctx, platform, token) {
     }
 
     case 'unified-push': {
-      if (!UNIFIED_PUSH_URL_REGEX.test(token)) {
-        throw Boom.badRequest(
-          ctx.translateError('PUSH_TOKEN_UNIFIED_PUSH_INVALID')
-        );
-      }
-
-      // SSRF prevention: validate the endpoint doesn't target private IPs
-      validateUrlNotPrivate(ctx, token);
-      break;
+      return normalizeUnifiedPushSubscription(ctx, token);
     }
 
     case 'web-push': {
@@ -255,8 +315,10 @@ async function create(ctx) {
     );
   }
 
-  // Validate token
-  validateToken(ctx, platform, token);
+  // Validate token. UnifiedPush returns canonical subscription JSON so the
+  // same endpoint/key tuple cannot be stored multiple times with different
+  // property ordering or ignored fields.
+  const validatedToken = validateToken(ctx, platform, token);
 
   // Validate device_name: must be a string if provided
   if (device_name !== undefined && device_name !== null) {
@@ -278,7 +340,12 @@ async function create(ctx) {
 
   const { aliasId, userId } = await resolveAliasAndUser(ctx, alias_id);
 
-  const normalizedToken = platform === 'apns' ? token.toLowerCase() : token;
+  const normalizedToken =
+    platform === 'apns'
+      ? token.toLowerCase()
+      : platform === 'unified-push'
+      ? validatedToken
+      : token;
 
   // Check if this is an update to an existing token (not a new registration)
   const existingToken = await PushTokens.findOne({
@@ -421,6 +488,12 @@ module.exports = {
   remove,
   removeAll,
   // Exported for testing
-  _test: { validateToken, resolveAliasAndUser, toJSON, validateUrlNotPrivate },
+  _test: {
+    validateToken,
+    normalizeUnifiedPushSubscription,
+    resolveAliasAndUser,
+    toJSON,
+    validateUrlNotPrivate
+  },
   MAX_TOKENS_PER_ALIAS
 };
